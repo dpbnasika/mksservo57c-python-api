@@ -4,7 +4,7 @@ Before you run the script, setup following on motor using the embedded board but
 Direction set to counter clock wise on the motor
 set to 0 origin
 set to uart mode
-set baudrate to 9600
+set baudrate to 38400
 set uart address to 0x01
 Use a USB to RS485 controller
 
@@ -25,11 +25,21 @@ import time
 import threading
 
 class MotorController:
-    def __init__(self, port, baudrate=9600, timeout=1):
+    def __init__(self, port = '/dev/ttyUSB0', baudrate=38400, timeout=1):
         self.ser = serial.Serial(port, baudrate, timeout=timeout)
-        self.current_position = 0
-        self.previous_position = 0
+        self.current_position = None
+        self.degrees_corresponding_to_int32 = None
+        self.get_current_position_response_thread = threading.Thread(target=self.get_current_position_response)
+        self.input_thread = threading.Thread(target=self.user_input)
         
+    def start(self):
+        self.get_current_position_response_thread.start()
+        self.input_thread.start()
+    
+    def join(self):
+        self.get_current_position_response_thread.join()
+        self.input_thread.join()
+
     def send_packet(self, packet):
         self.ser.write(packet)
 
@@ -45,14 +55,13 @@ class MotorController:
         byte_head = 0xfa
         pos_control_id = 0xfd
         pulses_for_desired_position = int(position*(3200/360)) #for 1.8 degrees and 16 sub divisions to reach 360 degrees
-        print(pulses_for_desired_position)
         pulse_to_bytes = pulses_for_desired_position.to_bytes(4,byteorder='big')
         packet = bytearray()
         packet.append(byte_head)
         packet.append(slave_address)
         packet.append(pos_control_id)
         packet.append(0x00) #counter clockwise direction
-        packet.append(0x05) #speed
+        packet.append(0x09) #speed
         packet.append(0x02) #acceleration
         packet.append(pulse_to_bytes[0])
         packet.append(pulse_to_bytes[1])
@@ -65,16 +74,14 @@ class MotorController:
     def set_cw_position(self, slave_address, position):
         byte_head = 0xfa
         pos_control_id = 0xfd
-        
         pulses_for_desired_position = int(position*(3200/360)) 
-        print(pulses_for_desired_position)
         pulse_to_bytes = pulses_for_desired_position.to_bytes(4,byteorder='big')
         packet = bytearray()
         packet.append(byte_head)
         packet.append(slave_address)
         packet.append(pos_control_id)
         packet.append(0x80) #clock wise direction
-        packet.append(0x05) #speed
+        packet.append(0x09) #speed
         packet.append(0x02) #acceleration
         packet.append(pulse_to_bytes[0])
         packet.append(pulse_to_bytes[1])
@@ -85,15 +92,15 @@ class MotorController:
         self.send_packet(packet)
 
     def set_absolute_position(self, slave_address, set_position):
-        
+        self.stop(slave_address)
+        time.sleep(2)
         if set_position > self.current_position:
             self.difference = (set_position - self.current_position)
-            self.set_ccw_position(slave_address,self.difference)
-            self.current_position = set_position
+            self.set_cw_position(slave_address,self.difference)
         if set_position < self.current_position:
             self.difference = -1*(set_position - self.current_position)
-            self.set_cw_position(slave_address,self.difference)
-            self.current_position = set_position
+            self.set_ccw_position(slave_address,self.difference)
+
 
     def stop(self, slave_address):
         packet = bytearray()
@@ -107,7 +114,7 @@ class MotorController:
         packet.append(crc)
         self.send_packet(packet)
 
-    def get_current_position(self):
+    def send_position_request(self):
         packet = bytearray()
         packet.append(0xfa)
         packet.append(0x01)
@@ -122,35 +129,62 @@ class MotorController:
     def map_degrees_to_int32(self, x, in_min, in_max, out_min, out_max):
         return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
-    def homing(self):
-        self.get_current_position()
-        response = self.receive_packet()
-        if response:
-            print('Received packet:', response)
-            print(len(response))
-            if len(response) == 8:
-                response_packet = bytearray()
-                response_packet.append(response[3])
-                response_packet.append(response[4])
-                response_packet.append(response[5])
-                response_packet.append(response[6])
-        degrees_corresponding_to_int32 = int.from_bytes(response_packet,"big")
-        print(degrees_corresponding_to_int32)
-        self.current_position = self.map_degrees_to_int32(degrees_corresponding_to_int32,0,3200,0,360)
-        return degrees_corresponding_to_int32
+    def get_current_position_response(self):
+        while True:
+            self.send_position_request()
+            response = self.receive_packet()
+            if response:
+                if (len(response) == 8):
+                    if (response[0] == 0xfb and response[1]==0x01 and response[2] == 0x33):
+                        response_packet = bytearray()
+                        response_packet.append(response[3])
+                        response_packet.append(response[4])
+                        response_packet.append(response[5])
+                        response_packet.append(response[6])
+                        self.degrees_corresponding_to_int32 = int.from_bytes(response_packet,"big")
+                        self.current_position = self.map_degrees_to_int32(self.degrees_corresponding_to_int32,0,3200,0,360)
+                if (len(response) == 7):
+                    if (response[0] == 0xfb and response[1]==0x01 and response[2] == 0x33):
+                        response_packet = bytearray()
+                        response_packet.append(response[3])
+                        response_packet.append(response[4])
+                        response_packet.append(response[5])
+                        self.degrees_corresponding_to_int32 = int.from_bytes(response_packet,"big")
+                        self.current_position = self.map_degrees_to_int32(self.degrees_corresponding_to_int32,0,3200,0,360)
+                if (len(response) == 6):
+                    if (response[0] == 0xfb and response[1]==0x01 and response[2] == 0x33):
+                        response_packet = bytearray()
+                        response_packet.append(response[3])
+                        response_packet.append(response[4])
+                        self.degrees_corresponding_to_int32 = int.from_bytes(response_packet,"big")
+                        self.current_position = self.map_degrees_to_int32(self.degrees_corresponding_to_int32,0,3200,0,360)
+                if (len(response) == 5):
+                    if (response[0] == 0xfb and response[1]==0x01 and response[2] == 0x33):
+                        response_packet = bytearray()
+                        response_packet.append(response[3])
+                        self.degrees_corresponding_to_int32 = int.from_bytes(response_packet,"big")
+                        self.current_position = self.map_degrees_to_int32(self.degrees_corresponding_to_int32,0,3200,0,360)
+                    
+
+    def user_input(self):
+        while True:
+            num = int(input("Enter an integer: "))
+            if num < 0 or num > 360:
+                print("enter only in the range of 0 to 360")
+            else:
+                print("Position in user input loop: ")
+                print(self.current_position)
+                print("Position in user input loop pulses: ")
+                self.set_absolute_position(0x01,num)
+
 
 
 def main():
 
-    motor = MotorController('/dev/ttyUSB1')
-    motor.homing()
-    #print("value is: ", motor.map_degrees_to_int32(value,0,3200,0,360))
-    while True:
-        num = int(input("Enter an integer: "))
-        if num < 0 or num > 360:
-            print("enter only in the range of 0 to 360")
-        else:
-            motor.set_absolute_position(0x01,num)
+    motor = MotorController()
+    motor.start()
+    motor.join()
 
+        
 if __name__ == '__main__':
     main()
